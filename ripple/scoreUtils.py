@@ -4,8 +4,10 @@ from common.constants import mods
 def isRankable(m, allow_relax = False):
 	"""
 	Checks if `m` contains unranked mods
+	Allows relax & autopilot mods if `allow_relax` is True
 
 	:param m: mods enum
+	:param allow_relax: boolean
 	:return: True if there are no unranked mods in `m`, else False
 	"""
 	# TODO: Check other modes unranked mods ...?
