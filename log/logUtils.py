@@ -136,7 +136,7 @@ def pm(message):
 	"""
 	logMessage(message, "CHAT", bcolors.BLUE)
 
-def rap(userID, message, discord=False, through=glob.BOT_NAME):
+def rap(userID, message, discord=False, through=None):
 	"""
 	Log a message to Admin Logs.
 
@@ -146,6 +146,9 @@ def rap(userID, message, discord=False, through=glob.BOT_NAME):
 	:param through: through string. Default: FokaBot
 	:return:
 	"""
+	if through is None: #Set default messager to bot account
+		through = glob.BOT_NAME
+
 	glob.db.execute("INSERT INTO rap_logs (id, userid, text, datetime, through) VALUES (NULL, %s, %s, %s, %s)", [userID, message, int(time.time()), through])
 	username = userUtils.getUsername(userID)
 	logMessage("{} {}".format(username, message), discord=True)
