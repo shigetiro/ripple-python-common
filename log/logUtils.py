@@ -136,7 +136,7 @@ def pm(message):
 	"""
 	logMessage(message, "CHAT", bcolors.BLUE)
 
-def rap(userID, message, discord=False, through="FokaBot"):
+def rap(userID, message, discord=False, through=glob.BOT_NAME):
 	"""
 	Log a message to Admin Logs.
 
