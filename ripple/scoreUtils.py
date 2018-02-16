@@ -1,20 +1,16 @@
 from common.constants import mods
+from objects import glob
 
 
-def isRankable(m, allow_relax = False):
+def isRankable(m):
 	"""
 	Checks if `m` contains unranked mods
-	Allows relax & autopilot mods if `allow_relax` is True
 
 	:param m: mods enum
-	:param allow_relax: boolean
 	:return: True if there are no unranked mods in `m`, else False
 	"""
-	# TODO: Check other modes unranked mods ...?
-	if allow_relax:
-		return not ((m & mods.RELAX > 0 and m & mods.RELAX2 > 0) or (m & mods.AUTOPLAY > 0) or (m & mods.SCOREV2 > 0))
-	else:
-		return not ((m & mods.RELAX > 0) or (m & mods.RELAX2 > 0) or (m & mods.AUTOPLAY > 0) or (m & mods.SCOREV2 > 0))
+	# I know bitmasks... so get that old trash out of here ktnxbye
+	return m & ~glob.conf.extra["_unranked-mods"] == m
 
 def readableGameMode(gameMode):
 	"""
