@@ -10,7 +10,7 @@ def isRankable(m):
 	:return: True if there are no unranked mods in `m`, else False
 	"""
 	# I know bitmasks... so get that old trash out of here ktnxbye
-	return m & ~glob.conf.extra["_unranked-mods"] == m
+	return m & ~glob.conf.extra["_unranked-mods"] == m && m & ~8320 != 0
 
 def readableGameMode(gameMode):
 	"""
