@@ -1,16 +1,17 @@
 from common.constants import mods
-from objects import glob
 
-
-def isRankable(m):
+def isRankable(m, gameMode = 0):
 	"""
 	Checks if `m` contains unranked mods
 
 	:param m: mods enum
 	:return: True if there are no unranked mods in `m`, else False
 	"""
-	# I know bitmasks... so get that old trash out of here ktnxbye
-	return m & ~glob.conf.extra["_unranked-mods"] == m and m & ~8320 != 0
+	# TODO: Check other modes unranked mods ...?
+	if gameMode != 0: 
+		return not ((m & mods.RELAX > 0) or (m & mods.RELAX2 > 0) or (m & mods.AUTOPLAY > 0) or (m & mods.SCOREV2 > 0))
+	else:
+		return not (m & mods.AUTOPLAY > 0)
 
 def readableGameMode(gameMode):
 	"""
@@ -29,6 +30,11 @@ def readableGameMode(gameMode):
 	else:
 		return "mania"
 
+def scoreType(m):
+	r = "1" 
+	if m & mods.SCOREV2 > 0:
+		r = "2"
+	return r
 def readableMods(m):
 	"""
 	Return a string with readable std mods.
@@ -58,4 +64,8 @@ def readableMods(m):
 		r += "SO"
 	if m & mods.TOUCHSCREEN > 0:
 		r += "TD"
+	if m & mods.RELAX > 0:
+		r += "RX"
+	if m & mods.RELAX2 > 0:
+		r += "AP"	
 	return r
