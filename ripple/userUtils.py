@@ -1,18 +1,60 @@
 import time
-import decimal
+from _mysql import ProgrammingError
+import requests
+import json
+
 from common import generalUtils
 from common.constants import gameModes
 from common.constants import privileges
-from common.constants import mods
 from common.log import logUtils as log
 from common.ripple import passwordUtils, scoreUtils
 from objects import glob
-from helpers import leaderboardHelper
+from common.akatsuki.discord_hooks import Webhook
+from urllib.parse import urlencode
 
-def logUserLog(log,fileMd5,userID, gameMode):
-	glob.db.execute("INSERT INTO users_logs (user, log, time, game_mode, beatmap_md5) VALUES (%s, %s, %s, %s, %s)",[userID, log, int(time.time()), gameMode, fileMd5])
-	return True
+def getBeatmapTime(beatmapID):
+	p = 0
+	r = requests.get("http://cg.mxr.lol/api/b/{}".format(beatmapID)).text
+	if r != "null\n":
+		p = json.loads(r)['TotalLength']
 
+	return p
+
+def incrementPlaytime(userID, gameMode=0, length=0):
+	modeForDB = gameModes.getGameModeForDB(gameMode)
+	result = glob.db.fetch("SELECT playtime_{gm} as playtime FROM users_stats WHERE id = %s".format(gm=modeForDB), [userID])
+	if result is not None:
+		glob.db.execute("UPDATE users_stats SET playtime_{gm} = %s WHERE id = %s".format(gm=modeForDB), [(int(result['playtime'])+int(length)), userID])
+
+def getPlaytime(userID, gameMode=0):
+	modeForDB = gameModes.getGameModeForDB(gameMode)
+	result = glob.db.fetch("SELECT playtime_{gm} as playtime FROM users_stats WHERE id = %s".format(gm=modeForDB), [userID])
+	if result is not None:
+		return int(result['playtime'])
+
+def getRelaxStats(userID, gameMode):
+	"""
+	Get all relax stats relative to `gameMode`
+
+	:param userID:
+	:param gameMode: game mode number
+	:return: dictionary with result
+	"""
+	modeForDB = gameModes.getGameModeForDB(gameMode)
+	
+	stats = glob.db.fetch("""SELECT
+						ranked_score_{gm} AS rankedScore,
+						avg_accuracy_{gm} AS accuracy,
+						playcount_{gm} AS playcount,
+						total_score_{gm} AS totalScore,
+						pp_{gm} AS pp
+						FROM rx_stats WHERE id = %s LIMIT 1""".format(gm=modeForDB), [userID])
+						
+	stats["gameRank"] = rxgetGameRank(userID, gameMode) # idk what zrevrank is, might fix sometime
+
+	# Return stats + game rank
+	return stats
+	
 def getUserStats(userID, gameMode):
 	"""
 	Get all user stats relative to `gameMode`
@@ -33,11 +75,7 @@ def getUserStats(userID, gameMode):
 						FROM users_stats WHERE id = %s LIMIT 1""".format(gm=modeForDB), [userID])
 
 	# Get game rank
-	result = glob.db.fetch("SELECT position FROM leaderboard_{} WHERE user = %s LIMIT 1".format(modeForDB), [userID])
-	if result is None:
-		stats["gameRank"] = 0
-	else:
-		stats["gameRank"] = result["position"]
+	stats["gameRank"] = getGameRank(userID, gameMode)
 
 	# Return stats + game rank
 	return stats
@@ -215,6 +253,33 @@ def updateLevel(userID, gameMode=0, totalScore=0):
 	# Save new level
 	glob.db.execute("UPDATE users_stats SET level_{m} = %s WHERE id = %s LIMIT 1".format(m=mode), [level, userID])
 
+def rxupdateLevel(userID, gameMode=0, totalScore=0):
+	"""
+	Update level in DB for userID relative to gameMode
+
+	:param userID: user id
+	:param gameMode: game mode number
+	:param totalScore: new total score
+	:return:
+	"""
+	# Make sure the user exists
+	# if not exists(userID):
+	#	return
+
+	# Get total score from db if not passed
+	mode = scoreUtils.readableGameMode(gameMode)
+	if totalScore == 0:
+		totalScore = glob.db.fetch(
+			"SELECT total_score_{m} as total_score FROM rx_stats WHERE id = %s LIMIT 1".format(m=mode), [userID])
+		if totalScore:
+			totalScore = totalScore["total_score"]
+
+	# Calculate level from totalScore
+	level = getLevel(totalScore)
+
+	# Save new level
+	glob.db.execute("UPDATE rx_stats SET level_{m} = %s WHERE id = %s LIMIT 1".format(m=mode), [level, userID])
+	
 def calculateAccuracy(userID, gameMode):
 	"""
 	Calculate accuracy value for userID relative to gameMode
@@ -224,9 +289,13 @@ def calculateAccuracy(userID, gameMode):
 	:return: new accuracy
 	"""
 	# Select what to sort by
+	if gameMode == 0:
+		sortby = "pp"
+	else:
+		sortby = "accuracy"
 	# Get best accuracy scores
 	bestAccScores = glob.db.fetchAll(
-		"SELECT accuracy FROM scores WHERE userid = %s AND play_mode = %s AND completed = 3 ORDER BY pp DESC LIMIT 500",
+		"SELECT accuracy FROM scores WHERE userid = %s AND play_mode = %s AND completed = 3 ORDER BY " + sortby + " DESC LIMIT 500",
 		[userID, gameMode])
 
 	v = 0
@@ -256,143 +325,64 @@ def calculatePP(userID, gameMode):
 	:return: total PP
 	"""
 	# Get best pp scores
-	bestPPScores = glob.db.fetchAll(
-		"SELECT pp FROM scores WHERE userid = %s AND play_mode = %s AND completed = 3 ORDER BY pp DESC LIMIT 500",
+	return sum(round(round(row["pp"]) * 0.95 ** i) for i, row in enumerate(glob.db.fetchAll(
+		"SELECT pp FROM scores LEFT JOIN(beatmaps) USING(beatmap_md5) "
+		"WHERE userid = %s AND play_mode = %s AND completed = 3 AND ranked >= 2 AND disable_pp = 0 AND pp IS NOT NULL "
+		"ORDER BY pp DESC LIMIT 500",
+		(userID, gameMode)
+	)))
+
+def rxcalculatePP(userID, gameMode):
+	"""
+	Calculate userID's total PP for gameMode
+
+	:param userID: user id
+	:param gameMode: game mode number
+	:return: total PP
+	"""
+	# Get best pp scores
+	return sum(round(round(row["pp"]) * 0.95 ** i) for i, row in enumerate(glob.db.fetchAll(
+		"SELECT pp FROM scores_relax LEFT JOIN(beatmaps) USING(beatmap_md5) "
+		"WHERE userid = %s AND play_mode = %s AND completed = 3 AND ranked >= 2 AND disable_pp = 0 AND pp IS NOT NULL "
+		"ORDER BY pp DESC LIMIT 500",
+		(userID, gameMode)
+	)))
+
+def rxcalculateAccuracy(userID, gameMode):
+	"""
+	Calculate accuracy value for userID relative to gameMode
+
+	:param userID: user id
+	:param gameMode: game mode number
+	:return: new accuracy
+	"""
+	# Select what to sort by
+	if gameMode == 0:
+		sortby = "pp"
+	else:
+		sortby = "accuracy"
+	# Get best accuracy scores
+	bestAccScores = glob.db.fetchAll(
+		"SELECT accuracy FROM scores_relax WHERE userid = %s AND play_mode = %s AND completed = 3 ORDER BY " + sortby + " DESC LIMIT 500",
 		[userID, gameMode])
 
-	# Calculate weighted PP
-	totalPP = 0
-	if bestPPScores is not None:
+	v = 0
+	if bestAccScores is not None:
+		# Calculate weighted accuracy
+		totalAcc = 0
+		divideTotal = 0
 		k = 0
-		for i in bestPPScores:
-			new = i["pp"] * pow(0.95, k)
-			totalPP += new
+		for i in bestAccScores:
+			add = int((0.95 ** k) * 100)
+			totalAcc += i["accuracy"] * add
+			divideTotal += add
 			k += 1
-
-	return round(totalPP)
-
-def addModsBonus(x, m, pp):
-	if m & mods.HIDDEN > 0:
-		x *= 1.032
-	if m & mods.FLASHLIGHT > 0 and pp > 100:
-		x *= 3
-	return x
-
-def lengthBonusMultiplier(l):
-    if (l <= 320):
-        return 1
-    if (l >= 30*60):
-        return 30
-    return (l-320)*29.0/(1800-320)+1
-	
-def recalcFirstPlaces(userID):
-	
-	c = glob.db.fetch("select * from user_first_places WHERE userid = %s",[userID])
-	
-	fs = glob.db.fetchAll("SELECT o.pp pp, o.mods mods,	beatmap_id, difficulty_std stars, difficulty_hr starsHR, difficulty_dt starsDT, hit_length length FROM (SELECT scores.* from scores JOIN users ON scores.userid = users.id WHERE privileges > 2 AND completed = 3 AND play_mode = 0) o LEFT JOIN (SELECT scores.* from scores JOIN users ON scores.userid = users.id WHERE privileges > 2 AND completed = 3 AND play_mode = 0) b on o.beatmap_md5 = b.beatmap_md5 AND o.pp < b.pp JOIN beatmaps ON o.beatmap_md5 = beatmaps.beatmap_md5 WHERE b.pp is NULL AND o.userid = %s AND o.play_mode = 0 AND o.completed = 3 AND o.pp > 40",[userID])
-
-	if fs is None:
-		return
-
-	fvalue = 0		
-	for f in fs:
-		mod = scoreUtils.readableMods(int(f["mods"]) & 80)
-		stars = f["stars"]
-		if(mod == "HR" or mod == "DT"):
-			if(f["stars{}".format(mod)] <= 0):
-				log.error("stars <= 0 beatmap: {}".format(f["beatmap_id"]))
-			else:
-				stars = f["stars{}".format(mod)]
-				
-		cv = addModsBonus(stars,f["mods"],f["pp"]) ** 4.45 / 800
-		fvalue += cv * lengthBonusMultiplier(f["length"])
-	
-	fvalue = round(fvalue)
-	
-	if c is None:
-		glob.db.execute("INSERT INTO user_first_places(userid,value) VALUES(%s,%s)",[userID, fvalue])
-	else:
-		glob.db.execute("UPDATE user_first_places SET value = %s WHERE userID = %s",[fvalue, userID])
-	
-def peakRankBonus(d):
-    if d > 5000:
-        return 0
-    if d < 10:
-        return 1000.0 / d**0.5
-    if d < 100:
-        return 3160 / d
-    return (5000**2 - d**2) / 500**2
-
-def rankedScoreBonus(s):
-    return s ** decimal.Decimal(1.0/3.6)
-	
-def calculateUserClanPerformance(userID):
-	total_rating = 0
-
-	# 1. Top scores
-	
-	bestPPScore = glob.db.fetch("SELECT max(scores.pp) pp FROM scores WHERE userid = %s AND play_mode = 0 AND completed = 3 GROUP BY userid ORDER BY pp DESC LIMIT 1",[userID])
-
-	if bestPPScore is not None:
-		total_rating += bestPPScore["pp"] ** 2 / 400.0
-	
-	# 2. Top 1 places
-	
-	topPlaces = glob.db.fetch("SELECT value FROM user_first_places WHERE userid = %s",[userID])
-	
-	if topPlaces is None:
-		recalcFirstPlaces(userID)
-		topPlaces = glob.db.fetch("SELECT value FROM user_first_places WHERE userid = %s",[userID])
-	
-	if topPlaces is not None:
-		total_rating += int(topPlaces["value"])
-		
-	
-	# 3. peak rank
-	
-	peakRank = glob.db.fetch("select peak_rank from users_peak_rank WHERE userid = %s",[userID])
-	
-	if peakRank is not None:
-		total_rating += round(peakRankBonus(peakRank["peak_rank"]))
-	
-	return total_rating
-	
-def calculateClanRating(clanID, gameMode):
-	"""
-	Calculate clan rating
-
-	:param clanID: clan id
-	:param gameMode: game mode number
-	:return: clan rating
-	"""
-	if(gameMode != 0):
-		return
-	total_rating = 0
-	
-	# 1. Sum of user performances
-	ps = glob.db.fetch("SELECT SUM(performance) performance FROM clan_users WHERE clanid = %s",[clanID])
-	if ps is not None:
-		total_rating += ps["performance"]
-	
-	# 2. Medals
-	medals = glob.db.fetch("SELECT SUM(points) points  FROM clan_badges JOIN badges  WHERE clan_badges.clan = %s",[clanID])
-
-	if medals is not None:
-		if total_rating is not None and medals["points"] is not None:
-			total_rating += medals["points"]
-	
-	#3. Total users ranked score
-	rs = glob.db.fetch("select SUM(users_stats.ranked_score_std) ranked_score_std from users_stats JOIN clan_users ON clan_users.userid = users_stats.id where clanid = %s GROUP BY clanid",[clanID])
-	if rs is not None:
-		total_rating += rankedScoreBonus(rs["ranked_score_std"])
-	
-	#4. Map siege points
-	siege_points = glob.db.fetch("SELECT points FROM clan_siege_points WHERE clanid = %s",[clanID])
-	
-	if siege_points is not None:
-		total_rating += decimal.Decimal(siege_points["points"])
-	
-	return total_rating
+		# echo "$add - $totalacc - $divideTotal\n"
+		if divideTotal != 0:
+			v = totalAcc / divideTotal
+		else:
+			v = 0
+	return v
 	
 def updateAccuracy(userID, gameMode):
 	"""
@@ -406,6 +396,35 @@ def updateAccuracy(userID, gameMode):
 	mode = scoreUtils.readableGameMode(gameMode)
 	glob.db.execute("UPDATE users_stats SET avg_accuracy_{m} = %s WHERE id = %s LIMIT 1".format(m=mode),
 					[newAcc, userID])
+
+def rxupdateAccuracy(userID, gameMode):
+	"""
+	Update accuracy value for userID relative to gameMode in DB
+
+	:param userID: user id
+	:param gameMode: gameMode number
+	:return:
+	"""
+	newAcc = rxcalculateAccuracy(userID, gameMode)
+	mode = scoreUtils.readableGameMode(gameMode)
+	glob.db.execute("UPDATE rx_stats SET avg_accuracy_{m} = %s WHERE id = %s LIMIT 1".format(m=mode),
+					[newAcc, userID])
+					
+def rxupdatePP(userID, gameMode):
+	"""
+	Update userID's pp with new value
+
+	:param userID: user id
+	:param gameMode: game mode number
+	"""
+	# Make sure the user exists
+	# if not exists(userID):
+	#	return
+
+	# Get new total PP and update db
+	newPP = rxcalculatePP(userID, gameMode)
+	mode = scoreUtils.readableGameMode(gameMode)
+	glob.db.execute("UPDATE rx_stats SET pp_{}=%s WHERE id = %s LIMIT 1".format(mode), [newPP, userID])					
 
 def updatePP(userID, gameMode):
 	"""
@@ -423,51 +442,43 @@ def updatePP(userID, gameMode):
 	mode = scoreUtils.readableGameMode(gameMode)
 	glob.db.execute("UPDATE users_stats SET pp_{}=%s WHERE id = %s LIMIT 1".format(mode), [newPP, userID])
 
-def getClanID(userID):
-	d = glob.db.fetch("SELECT clanid from clan_users WHERE userid = %s LIMIT 1", [userID])
-	if d is not None:
-		return d["clanid"]
-	else:
-		return None
-
-def updateUserClanPerformance(userID):
-	clanID = getClanID(userID)
-	
-	if clanID is not None:
-		newUserPerformance = calculateUserClanPerformance(userID)
-		glob.db.execute("UPDATE clan_users SET performance = %s WHERE userid = %s LIMIT 1", [newUserPerformance, userID])
-
-def updateEmptyUserClanPerformances(clanID):
-	users = glob.db.fetchAll("SELECT * from clan_users WHERE clanid = %s",[clanID])
-	if users is not None:
-		for user in users:
-			topPlaces = glob.db.fetch("SELECT * from user_first_places WHERE userid = %s",[user["userid"]])
-			if topPlaces is None:
-				recalcFirstPlaces(user["userid"])
-		
-			if (user["performance"] < 1):
-				updateUserClanPerformance(user["userid"])
-			
-		
-def updateClanRating(userID, gameMode):
+def rxupdateStats(userID, __score):
 	"""
-	Update userID's pp with new value
+	Update stats (playcount, total score, ranked score, level bla bla)
+	with data relative to a score object
 
-	:param userID: user id
-	:param gameMode: game mode number
+	:param userID:
+	:param __score: score object
 	"""
 
-	gameMode = 0 #STD for now
-	# Get new clan rating update db
-	clanID = getClanID(userID)
-	
-	if clanID is not None:
-		updateEmptyUserClanPerformances(clanID)
-		
-		newClanRating = calculateClanRating(clanID,gameMode)
-		glob.db.execute("UPDATE clans SET performance = %s WHERE id = %s LIMIT 1", [newClanRating, clanID])
-		leaderboardHelper.updateClans(clanID, newClanRating)
+	# Make sure the user exists
+	if not exists(userID):
+		log.warning("User {} doesn't exist.".format(userID))
+		return
 
+	# Get gamemode for db
+	mode = scoreUtils.readableGameMode(__score.gameMode)
+
+	# Update total score and playcount
+	glob.db.execute(
+		"UPDATE rx_stats SET total_score_{m}=total_score_{m}+%s, playcount_{m}=playcount_{m}+1 WHERE id = %s LIMIT 1".format(
+			m=mode), [__score.score, userID])
+
+	# Calculate new level and update it
+	rxupdateLevel(userID, __score.gameMode)
+
+	# Update level, accuracy and ranked score only if we have passed the song
+	if __score.passed:
+		# Update ranked score
+		glob.db.execute(
+			"UPDATE rx_stats SET ranked_score_{m}=ranked_score_{m}+%s WHERE id = %s LIMIT 1".format(m=mode),
+			[__score.rankedScoreIncrease, userID])
+
+		# Update accuracy
+		rxupdateAccuracy(userID, __score.gameMode)
+
+		# Update pp
+		rxupdatePP(userID, __score.gameMode)
 	
 def updateStats(userID, __score):
 	"""
@@ -506,11 +517,6 @@ def updateStats(userID, __score):
 
 		# Update pp
 		updatePP(userID, __score.gameMode)
-		
-		# Update clan rating
-		updateUserClanPerformance(userID)
-		
-		updateClanRating(userID, __score.gameMode)
 
 def updateLatestActivity(userID):
 	"""
@@ -552,7 +558,39 @@ def getPP(userID, gameMode):
 	else:
 		return 0
 
-def incrementReplaysWatched(scoreID, userID, gameMode):
+def checkVipsuNotifications(userID):
+	"""
+	Check if a user has disabled their vipsu notifications (switching between regular and relax)
+
+	:param userID: user id
+	:return:
+	"""
+	result = glob.db.fetch("SELECT switch_notifs FROM users WHERE id = {} LIMIT 1".format(userID))
+	if result is not None:
+		return result["switch_notifs"]
+	else:
+		return 0
+
+def toggleVipsuNotifications(userID):
+	"""
+	Toggle a users vipsu notifications (switching between regular and relax)
+
+	:param userID: user id
+	"""
+
+	notif_current = checkVipsuNotifications(userID)
+
+	if notif_current == 1:
+		notif_update = 0
+	elif notif_current == 0:
+		notif_update = 1
+	else:
+		return 2
+
+	glob.db.execute("UPDATE users SET switch_notifs = {update} WHERE id = {userid}".format(update=notif_update, userid=userID))
+	return notif_update
+
+def incrementReplaysWatched(userID, gameMode, mods):
 	"""
 	Increment userID's replays watched by others relative to gameMode
 
@@ -561,11 +599,14 @@ def incrementReplaysWatched(scoreID, userID, gameMode):
 	:return:
 	"""
 	mode = scoreUtils.readableGameMode(gameMode)
-	glob.db.execute(
-		"UPDATE scores SET watched = watched + 1 WHERE id = %s LIMIT 1", [scoreID])
-	glob.db.execute(
-		"UPDATE users_stats SET replays_watched_{mode}=replays_watched_{mode}+1 WHERE id = %s LIMIT 1".format(
-			mode=mode), [userID])
+	if mods & 128:
+		glob.db.execute(
+			"UPDATE rx_stats SET replays_watched_{mode}=replays_watched_{mode}+1 WHERE id = %s LIMIT 1".format(
+				mode=mode), [userID])
+	else:
+		glob.db.execute(
+			"UPDATE users_stats SET replays_watched_{mode}=replays_watched_{mode}+1 WHERE id = %s LIMIT 1".format(
+				mode=mode), [userID])
 
 def getAqn(userID):
 	"""
@@ -598,8 +639,7 @@ def IPLog(userID, ip):
 	:param ip: IP address
 	:return:
 	"""
-	if ((ip != "127.0.0.1") & (ip != "::1")):
-		glob.db.execute("""INSERT INTO ip_user (userid, ip, occurencies) VALUES (%s, %s, '1')
+	glob.db.execute("""INSERT INTO ip_user (userid, ip, occurencies) VALUES (%s, %s, '1')
 						ON DUPLICATE KEY UPDATE occurencies = occurencies + 1""", [userID, ip])
 
 def checkBanchoSession(userID, ip=""):
@@ -623,12 +663,9 @@ def is2FAEnabled(userID):
 	:userID: user ID
 	:return: True if 2fa is enabled, else False
 	"""
-	result = glob.db.fetch("SELECT IFNULL((SELECT 1 FROM 2fa_telegram WHERE userid = %(userid)s LIMIT 1), 0) | IFNULL((SELECT 2 FROM 2fa_totp WHERE userid = %(userid)s AND enabled = 1 LIMIT 1), 0) AS x", {
+	return glob.db.fetch("SELECT 2fa_totp.userid FROM 2fa_totp WHERE userid = %(userid)s AND enabled = 1 LIMIT 1", {
 		"userid": userID
-	})
-	if result is None:
-		return False
-	return True if result["x"] > 0 else False
+	}) is not None
 
 def check2FA(userID, ip):
 	"""
@@ -641,6 +678,7 @@ def check2FA(userID, ip):
 	"""
 	if not is2FAEnabled(userID):
 		return False
+
 	result = glob.db.fetch("SELECT id FROM ip_user WHERE userid = %s AND ip = %s", [userID, ip])
 	return True if result is None else False
 
@@ -704,10 +742,16 @@ def ban(userID):
 	:param userID: user id
 	:return:
 	"""
+	# Set user as banned in db
 	banDateTime = int(time.time())
 	glob.db.execute("UPDATE users SET privileges = privileges & %s, ban_datetime = %s WHERE id = %s LIMIT 1",
 					[~(privileges.USER_NORMAL | privileges.USER_PUBLIC), banDateTime, userID])
+
+	# Notify bancho about the ban
 	glob.redis.publish("peppy:ban", userID)
+
+	# Remove the user from global and country leaderboards
+	removeFromLeaderboard(userID)
 
 def unban(userID):
 	"""
@@ -722,16 +766,22 @@ def unban(userID):
 
 def restrict(userID):
 	"""
-	Restruct userID
+	Restrict userID
 
 	:param userID: user id
 	:return:
 	"""
 	if not isRestricted(userID):
+		# Set user as restricted in db
 		banDateTime = int(time.time())
 		glob.db.execute("UPDATE users SET privileges = privileges & %s, ban_datetime = %s WHERE id = %s LIMIT 1",
 						[~privileges.USER_PUBLIC, banDateTime, userID])
+
+		# Notify bancho about this ban
 		glob.redis.publish("peppy:ban", userID)
+
+		# Remove the user from global and country leaderboards
+		removeFromLeaderboard(userID)
 
 def unrestrict(userID):
 	"""
@@ -769,6 +819,32 @@ def getPrivileges(userID):
 	result = glob.db.fetch("SELECT privileges FROM users WHERE id = %s LIMIT 1", [userID])
 	if result is not None:
 		return result["privileges"]
+	else:
+		return 0
+
+def getUserFlags(userID):
+	"""
+	Return `userID`'s flags
+
+	:param userID: user id
+	:return: flags number
+	"""
+	result = glob.db.fetch("SELECT flags FROM users WHERE id = %s LIMIT 1", [userID])
+	if result is not None:
+		return result["flags"]
+	else:
+		return 0
+
+def getFlagReason(userID):
+	"""
+	Return `userID`'s flag reasoning
+
+	:param userID: user id
+	:return: flag reason
+	"""
+	result = glob.db.fetch("SELECT flags_reason FROM users WHERE id = %s LIMIT 1", [userID])
+	if result is not None:
+		return result["flags_reason"]
 	else:
 		return 0
 
@@ -826,6 +902,20 @@ def getAccuracy(userID, gameMode):
 	modeForDB = gameModes.getGameModeForDB(gameMode)
 	return glob.db.fetch("SELECT avg_accuracy_"+modeForDB+" FROM users_stats WHERE id = %s LIMIT 1", [userID])["avg_accuracy_"+modeForDB]
 
+def rxgetGameRank(userID, gameMode):
+	"""
+	Get `userID`'s **in-game rank** (eg: #1337) relative to gameMode
+
+	:param userID: user id
+	:param gameMode: game mode number
+	:return: game rank
+	"""
+	position = glob.redis.zrevrank("ripple:relaxboard:{}".format(gameModes.getGameModeForDB(gameMode)), userID)
+	if position is None:
+		return 0
+	else:
+		return int(position) + 1
+	
 def getGameRank(userID, gameMode):
 	"""
 	Get `userID`'s **in-game rank** (eg: #1337) relative to gameMode
@@ -834,12 +924,11 @@ def getGameRank(userID, gameMode):
 	:param gameMode: game mode number
 	:return: game rank
 	"""
-	modeForDB = gameModes.getGameModeForDB(gameMode)
-	result = glob.db.fetch("SELECT position FROM leaderboard_"+modeForDB+" WHERE user = %s LIMIT 1", [userID])
-	if result is None:
+	position = glob.redis.zrevrank("ripple:leaderboard:{}".format(gameModes.getGameModeForDB(gameMode)), userID)
+	if position is None:
 		return 0
 	else:
-		return result["position"]
+		return int(position) + 1
 
 def getPlaycount(userID, gameMode):
 	"""
@@ -900,7 +989,7 @@ def removeFriend(userID, friendID):
 	:return:
 	"""
 	# Delete user relationship. We don't need to check if the relationship was there, because who gives a shit,
-	# if they were not friends and they don't want to be anymore, be it. ¯\_(ツ)_/¯
+	# if they were not friends and they don't want to be anymore, be it. Â¯\_(ãƒ„)_/Â¯
 	# TODO: LIMIT 1
 	glob.db.execute("DELETE FROM users_relationships WHERE user1 = %s AND user2 = %s", [userID, friendID])
 
@@ -967,6 +1056,39 @@ def setPrivileges(userID, priv):
 	"""
 	glob.db.execute("UPDATE users SET privileges = %s WHERE id = %s LIMIT 1", [priv, userID])
 
+def setUserFlags(userID, flags, flags_reason="", author=999):
+	"""
+	Silence someone
+
+	:param userID: user id
+	:param flags: time until restriction in seconds
+	:param flags_reason: reason shown on website
+	:return:
+	"""
+	# db qurey
+	flagsEndTime = int(time.time())+flags if flags > 0 else 0
+	glob.db.execute("UPDATE users SET flags = %s, flags_reason = %s WHERE id = %s LIMIT 1", [flagsEndTime, flags_reason, userID])
+
+	# Log
+	targetUsername = getUsername(userID)
+	# TODO: exists check im drunk rn i need to sleep (stampa piede ubriaco confirmed)
+	if flags > 0:
+		log.rap(author, "has scheduled a restriction on user: {} in {}. Reason: {}".format(targetUsername, flags, flags_reason), True)
+	else:
+		log.rap(author, "has cancelled {}'s scheduled restriction.".format(targetUsername), True)
+
+def getGroupPrivileges(groupName):
+	"""
+	Returns the privileges number of a group, by its name
+
+	:param groupName: name of the group
+	:return: privilege integer or `None` if the group doesn't exist
+	"""
+	groupPrivileges = glob.db.fetch("SELECT privileges FROM privileges_groups WHERE name = %s LIMIT 1", [groupName])
+	if groupPrivileges is None:
+		return None
+	return groupPrivileges["privileges"]
+
 def isInPrivilegeGroup(userID, groupName):
 	"""
 	Check if `userID` is in a privilege group.
@@ -985,8 +1107,23 @@ def isInPrivilegeGroup(userID, groupName):
 		userPrivileges = userToken.privileges
 	else:
 		userPrivileges = getPrivileges(userID)
-	return (userPrivileges == groupPrivileges) or (userPrivileges == (groupPrivileges | privileges.USER_DONOR))
+	return userPrivileges & groupPrivileges == groupPrivileges
 
+def isInAnyPrivilegeGroup(userID, groups):
+	"""
+	Checks if a user is in at least one of the specified groups
+
+	:param userID: id of the user
+	:param groups: groups list or tuple
+	:return: `True` if `userID` is in at least one of the specified groups, otherwise `False`
+	"""
+	userPrivileges = getPrivileges(userID)
+	return any(
+		userPrivileges & x == x
+		for x in (
+			getGroupPrivileges(y) for y in groups
+		) if x is not None
+	)
 
 def logHardware(userID, hashes, activation = False):
 	"""
@@ -1015,6 +1152,23 @@ def logHardware(userID, hashes, activation = False):
 		# Get username
 		username = getUsername(userID)
 
+		# cmyui vars
+		usualMAC = glob.conf.config['cmyui']['mac']
+		usualUniqueId = glob.conf.config['cmyui']['unique']
+		usualDiskId = glob.conf.config['cmyui']['disk']
+
+		if userID == 1001: # Remove cmyui permissions if on a HWID different than usual.. Just safety procautions.. TODO: make this for all admins
+			if usualMAC == hashes[2] and usualUniqueId == hashes[3] and usualDiskId == hashes[4]:
+				annmsg = "{}: Valid login.".format(username)
+				params = urlencode({"k": glob.conf.config['server']['cikey'], "to": "#admin", "msg": annmsg})
+				requests.get("http://127.0.0.1:5001/api/v1/fokabotMessage?{}".format(params))
+			else:
+				annmsg = "{}: Invalid login.".format(username)
+				params = urlencode({"k": glob.conf.config['server']['cikey'], "to": "#admin", "msg": annmsg})
+				requests.get("http://127.0.0.1:5001/api/v1/fokabotMessage?{}".format(params))
+				log.cmyui("{}: Unusual login detected.\n\nHashes: {}|{}|{}".format(userID, hashes[2], hashes[3], hashes[4]), discord="cm")
+				ban(userID)
+
 		# Get the list of banned or restricted users that have logged in from this or similar HWID hash set
 		if hashes[2] == "b4ec3c4334a0249dae95c284ec5983df":
 			# Running under wine, check by unique id
@@ -1033,6 +1187,7 @@ def logHardware(userID, hashes, activation = False):
 			banned = glob.db.fetchAll("""SELECT users.id as userid, hw_user.occurencies, users.username FROM hw_user
 				LEFT JOIN users ON users.id = hw_user.userid
 				WHERE hw_user.userid != %(userid)s
+				AND hw_user.mac = %(mac)s
 				AND hw_user.unique_id = %(uid)s
 				AND hw_user.disk_id = %(diskid)s
 				AND (users.privileges & 3 != 3)""", {
@@ -1194,7 +1349,6 @@ def getDonorExpire(userID):
 		return data["donor_expire"]
 	return 0
 
-
 class invalidUsernameError(Exception):
 	pass
 
@@ -1225,6 +1379,7 @@ def changeUsername(userID=0, oldUsername="", newUsername=""):
 	if " " in newUsername and "_" in newUsername:
 		raise invalidUsernameError()
 
+	# this is done twice in username command dont worry about it
 	# Get safe username
 	newUsernameSafe = safeUsername(newUsername)
 
@@ -1241,8 +1396,102 @@ def changeUsername(userID=0, oldUsername="", newUsername=""):
 	# Change username
 	glob.db.execute("UPDATE users SET username = %s, username_safe = %s WHERE id = %s LIMIT 1", [newUsername, newUsernameSafe, userID])
 	glob.db.execute("UPDATE users_stats SET username = %s WHERE id = %s LIMIT 1", [newUsername, userID])
+	glob.db.execute("UPDATE rx_stats SET username = %s WHERE id = %s LIMIT 1", [newUsername, userID])
 
 	# Empty redis username cache
 	# TODO: Le pipe woo woo
 	glob.redis.delete("ripple:userid_cache:{}".format(safeUsername(oldUsername)))
 	glob.redis.delete("ripple:change_username_pending:{}".format(userID))
+
+def removeFromLeaderboard(userID):
+	"""
+	Removes userID from global and country leaderboards.
+
+	:param userID:
+	:return:
+	"""
+	# Remove the user from global and country leaderboards, for every mode
+	country = getCountry(userID).lower()
+	for mode in ["std", "taiko", "ctb", "mania"]:
+		glob.redis.zrem("ripple:leaderboard:{}".format(mode), str(userID))
+		if country is not None and len(country) > 0 and country != "xx":
+			glob.redis.zrem("ripple:leaderboard:{}:{}".format(mode, country), str(userID))
+
+def deprecateTelegram2Fa(userID):
+	"""
+	Checks whether the user has enabled telegram 2fa on his account.
+	If so, disables 2fa and returns True.
+	If not, return False.
+
+	:param userID: id of the user
+	:return: True if 2fa has been disabled from the account otherwise False
+	"""
+	try:
+		telegram2Fa = glob.db.fetch("SELECT id FROM 2fa_telegram WHERE userid = %s LIMIT 1", (userID,))
+	except ProgrammingError:
+		# The table doesnt exist
+		return False
+
+	if telegram2Fa is not None:
+		glob.db.execute("DELETE FROM 2fa_telegram WHERE userid = %s LIMIT 1", (userID,))
+		return True
+	return False
+
+def unlockAchievement(userID, achievementID):
+	glob.db.execute("INSERT INTO users_achievements (user_id, achievement_id, `time`) VALUES"
+					"(%s, %s, %s)", [userID, achievementID, int(time.time())])
+
+def getAchievementsVersion(userID):
+	result = glob.db.fetch("SELECT achievements_version FROM users WHERE id = %s LIMIT 1", [userID])
+	if result is None:
+		return None
+	return result["achievements_version"]
+
+def updateAchievementsVersion(userID):
+	glob.db.execute("UPDATE users SET achievements_version = %s WHERE id = %s LIMIT 1", [
+		glob.ACHIEVEMENTS_VERSION, userID
+	])
+def getClan(userID):
+	"""
+	Get userID's clan
+
+	:param userID: user id
+	:return: username or None
+	"""
+	clanInfo = glob.db.fetch("SELECT clans.tag, clans.id, user_clans.clan, user_clans.user FROM user_clans LEFT JOIN clans ON clans.id = user_clans.clan WHERE user_clans.user = %s LIMIT 1", [userID])
+	username = getUsername(userID)
+	if clanInfo is None:
+		return username
+	return "[" + clanInfo["tag"] + "] " + username
+
+def collectUserInfo(userID, logType="cm"):
+	"""
+	Command only cuz I want to learn how to do python string stuff. not rly useful
+
+	:param userID: user id
+	:return: username or None
+	"""
+	if logType not in ['cm', 'bunker', 'staff', 'general']:
+		return "Please provide a valid logType."
+
+	users_info = glob.db.fetch("SELECT register_datetime, latest_activity, privileges, donor_expire, ban_datetime, silence_end, silence_reason, notes, username_safe, email FROM users WHERE id = {}".format(userID))
+
+	baseString = "Registeration time: {}\n".format(users_info["register_datetime"])
+	latest_activity = "Latest active time: {}\n".format(users_info["latest_activity"])
+
+	privileges = "Privileges: {}\n".format(users_info["privileges"])
+
+	previous_donate = "User previously donated: "
+	donor_expire = "True\nLatest active donor time: {}\n".format(users_info["donor_expire"]) if users_info["donor_expire"] else "False\n"
+
+	previous_ban = "User previously banned: "
+	ban_datetime = "True\nRestricted time: {}\n".format(users_info["ban_datetime"]) if users_info["ban_datetime"] else "False\n"
+
+	previous_silence = "User previously silenced: "
+	silence_end = "True\nSilenced time: {}\nSilence reason: {}\n\n".format(users_info["silence_end"], users_info["silence_reason"]) if users_info["silence_end"] else "False\n"
+	if len(users_info["notes"]) <= 1625:
+		cmNotes = "CM Notes:\n\n{}".format(users_info["notes"]) if users_info["notes"] else "No CM Notes found on this user.\n"
+		final = baseString + latest_activity + privileges + previous_donate + donor_expire + previous_ban + ban_datetime + previous_silence + silence_end + cmNotes + "\n\nInformation gathering complete."
+	else:
+		final = baseString + latest_activity + privileges + previous_donate + donor_expire + previous_ban + ban_datetime + previous_silence + silence_end + "\n\nInformation gathering complete."
+	glob.schiavo.sendCM("**Collecting User Info:**\nUserID: {}\nRest:\n{message}".format(userID, message=final.encode("latin-1").decode("utf-8")))
