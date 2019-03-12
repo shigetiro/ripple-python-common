@@ -1,5 +1,8 @@
 import requests
 from urllib.parse import urlencode
+from random import randint
+from common.akatsuki.discord_hooks import Webhook
+from objects import glob
 
 class schiavo:
 	"""
@@ -9,79 +12,86 @@ class schiavo:
 		"""
 		Initialize a new schiavo bot instance
 
-		:param botURL: schiavo api url.
-		:param prefix: text to prepend in every message, can be empty.
+		:param botURL: schiavo api url. oepsie i changed this a lot.
 		:param maxRetries: max retries if api request fail. 0 = don't retry.
 		"""
-		self.botURL = botURL
-		self.maxRetries = maxRetries
-		self.prefix = prefix
+		self.maxRetries = 20
 
-	def sendMessage(self, channel, message, noPrefix=False):
+	def sendMessage(self, message, botURL):
 		"""
 		Send a generic message through schiavo api
 
 		:param channel: api channel.
 		:param message: message content.
-		:param noPrefix: if True, don't prepend prefix to message.
+		:param customParams: Let all hell break loose
 		:return:
+
+		Let's call it 50% spaghetti code.. Deal..?
 		"""
-		if self.botURL is None:
+
+		if botURL is None:
 			return
+		else:
+			embed = Webhook(botURL, color=randint(100000, 999999))
+			#embed.set_author(name='Aika', icon='https://a.akatsuki.pw/999', url="http://akatsuki.pw/")
+			#embed.set_image('https://i.namir.in//bTr.png')
+			#embed.set_title(title="Aika")
+			embed.add_field(name=message, value='** **')
+
 		for _ in range(0, self.maxRetries):
 			try:
-				finalMsg = "{prefix} {message}".format(prefix=self.prefix if not noPrefix else "", message=message)
-				requests.get("{}/{}?{}".format(self.botURL, channel, urlencode({ "message": finalMsg })))
+				embed.post()
 				break
 			except requests.RequestException:
 				continue
 
-	def sendConfidential(self, message, noPrefix=False):
+
+	def sendConfidential(self, message):
 		"""
 		Send a message to #bunk
 
 		:param message: message content.
-		:param noPrefix: if True, don't prepend prefix to message.
 		:return:
 		"""
-		self.sendMessage("bunk", message, noPrefix)
+		botURL = glob.conf.config['webhooks']['confidential']
+		self.sendMessage(message, botURL)
 
-	def sendStaff(self, message, noPrefix=False):
+	def sendStaff(self, message):
 		"""
 		Send a message to #staff
 
 		:param message: message content.
-		:param noPrefix: if True, don't prepend prefix to message.
 		:return:
 		"""
-		self.sendMessage("staff", message, noPrefix)
+		botURL = glob.conf.config['webhooks']['staff']
+		self.sendMessage(message, botURL)
 
-	def sendGeneral(self, message, noPrefix=True):
+	def sendGeneral(self, message):
 		"""
 		Send a message to #general
 
 		:param message: message content.
-		:param noPrefix: if True, don't prepend prefix to message.
 		:return:
 		"""
-		self.sendMessage("general", message, noPrefix)
+		botURL = glob.conf.config['webhooks']['general']
+		self.sendMessage(message, botURL)
 
-	def sendChatlog(self, message, noPrefix=True):
+	def sendChatlog(self, message):
 		"""
 		Send a message to #chatlog.
 
 		:param message: message content.
-		:param noPrefix: if True, don't prepend prefix to message.
 		:return:
 		"""
-		self.sendMessage("chatlog", message, noPrefix)
+		botURL = glob.conf.config['webhooks']['chatlog']
+		self.sendMessage(message, botURL)
 
-	def sendCM(self, message, noPrefix=False):
+	def sendCM(self, message):
 		"""
 		Send a message to #communitymanagers
 
 		:param message: message content.
-		:param noPrefix: if True, don't prepend prefix to message.
 		:return:
 		"""
-		self.sendMessage("cm", message, noPrefix)
+		botURL = glob.conf.config['webhooks']['cm']
+		self.sendMessage(message, botURL)
