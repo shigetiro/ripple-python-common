@@ -1,6 +1,22 @@
 from common.constants import mods
+from objects import glob
 
-def isRankable(m, gameMode = 0):
+def newFirst(scoreID, userID, md5, mode, rx=0):
+	"""
+	set score into db
+
+	:param userID: user id
+	:param scoreID: score id
+	"""
+	# check if a score on that beatmap already exists with same mode
+	result = glob.db.fetch("SELECT scoreid FROM scores_first WHERE beatmap_md5 = '{}' AND mode = '{}' AND rx = '{relax}' LIMIT 1".format(md5, mode, relax=1 if rx else 0))
+	if result is None:
+		glob.db.execute("INSERT INTO scores_first VALUES('{}', '{}', '{}', '{}', '{relax}')".format(scoreID, userID, md5, mode, relax=1 if rx else 0))
+	else:
+		glob.db.execute("UPDATE scores_first SET userid = '{}', scoreid = '{}' WHERE beatmap_md5 = '{}' AND mode = '{}' AND rx = '{relax}'".format(userID, scoreID, md5, mode, relax=1 if rx else 0))
+
+
+def isRankable(m):
 	"""
 	Checks if `m` contains unranked mods
 
@@ -8,10 +24,7 @@ def isRankable(m, gameMode = 0):
 	:return: True if there are no unranked mods in `m`, else False
 	"""
 	# TODO: Check other modes unranked mods ...?
-	if gameMode != 0: 
-		return not ((m & mods.RELAX > 0) or (m & mods.RELAX2 > 0) or (m & mods.AUTOPLAY > 0) or (m & mods.SCOREV2 > 0))
-	else:
-		return not (m & mods.AUTOPLAY > 0)
+	return not ((m & mods.RELAX2 > 0) or (m & mods.AUTOPLAY > 0) or (m & mods.SCOREV2 > 0))
 
 def readableGameMode(gameMode):
 	"""
@@ -30,11 +43,6 @@ def readableGameMode(gameMode):
 	else:
 		return "mania"
 
-def scoreType(m):
-	r = "1" 
-	if m & mods.SCOREV2 > 0:
-		r = "2"
-	return r
 def readableMods(m):
 	"""
 	Return a string with readable std mods.
@@ -66,6 +74,4 @@ def readableMods(m):
 		r += "TD"
 	if m & mods.RELAX > 0:
 		r += "RX"
-	if m & mods.RELAX2 > 0:
-		r += "AP"	
 	return r
