@@ -33,7 +33,7 @@ class schiavo:
 			return
 		else:
 			embed = Webhook(botURL, color=randint(100000, 999999))
-			#embed.set_author(name='Aika', icon='https://a.akatsuki.pw/999', url="http://akatsuki.pw/")
+			#embed.set_author(name='Aika', icon='https://a.vipsu.pw/999', url="http://vipsu.pw/")
 			#embed.set_image('https://i.namir.in//bTr.png')
 			#embed.set_title(title="Aika")
 			embed.add_field(name=message, value='** **')
